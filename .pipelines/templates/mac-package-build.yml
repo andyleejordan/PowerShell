@@ -30,6 +30,7 @@ jobs:
       value: $(Build.SourcesDirectory)/PowerShell/.config/suppress.json
     - name: BuildArch
       value: ${{ parameters.buildArchitecture }}
+    - group: mscodehub-macos-package-signing
 
   steps:
   - checkout: self
@@ -158,92 +159,82 @@ jobs:
         Write-Host "##vso[artifact.upload containerfolder=macos-pkgs;artifactname=macos-pkgs]$file"
       }
 
+      $packageInfo = Get-MacOSPackageIdentifierInfo -Version '$(Version)'
+      Write-Verbose -Verbose "BundleId: $($packageInfo.PackageIdentifier)"
+      Write-Host "##vso[task.setvariable variable=BundleId]$($packageInfo.PackageIdentifier)"
+
     displayName: 'Package ${{ parameters.buildArchitecture}}'
     env:
       __DOTNET_RUNTIME_FEED_KEY: $(RUNTIME_SOURCEFEED_KEY)
 
-- job: sign_package_macOS_${{ parameters.buildArchitecture }}
-  displayName: Sign Package macOS ${{ parameters.buildArchitecture }}
-  dependsOn: package_macOS_${{ parameters.buildArchitecture }}
-  condition: succeeded()
-  pool:
-    type: windows
-
-  variables:
-  - name: ob_outputDirectory
-    value: '$(Build.ArtifactStagingDirectory)/ONEBRANCH_ARTIFACT'
-  - name: ob_sdl_binskim_enabled
-    value: true
-  - name: ob_sdl_credscan_suppressionsfileforartifacts
-    value: $(Build.SourcesDirectory)/PowerShell/.config/suppress.json
-  - name: BuildArch
-    value: ${{ parameters.buildArchitecture }}
-  - group: mscodehub-macos-package-signing
-
-  steps:
-  - download: current
-    artifact: macos-pkgs
-
-  - pwsh: |
-      $buildArch = '${{ parameters.buildArchitecture }}'
-      $macosRuntime = "osx-$buildArch"
-      $pkgNameFilter = "powershell-*$macosRuntime.pkg"
-      $pkgPath = Get-ChildItem -Path $(Pipeline.Workspace) -Filter $pkgNameFilter -Recurse -File
-
-      if ($pkgPath.Count -eq 0) {
-        throw "No package found for $macosRuntime"
-      }
-
-      foreach($p in $pkgPath) {
-        $file = $p.FullName
-        $fileName = $p.BaseName
-        Write-Verbose -verbose "Compressing $file"
-        $zipFile = "$(Pipeline.Workspace)\${fileName}.zip"
-        Write-Verbose -Verbose "Zip file: $zipFile"
-        Compress-Archive -Path $file -Destination $zipFile
-      }
-
-      Write-Verbose -Verbose "Compressed files:"
-      Get-ChildItem -Path $(Pipeline.Workspace) -Filter "*.zip" -File | Write-Verbose -Verbose
-    displayName: Compress package files for signing
-
-  - task: onebranch.pipeline.signing@1
-    displayName: 'OneBranch CodeSigning Package'
+  - task: EsrpCodeSigning@5
+    displayName: 'Sign macOS Installer Package'
     inputs:
-      command: 'sign'
-      files_to_sign: '**/*-osx-*.zip'
-      search_root: '$(Pipeline.Workspace)'
-      inline_operation: |
+      ConnectedServiceName: 'ESRPMacOSSigning'
+      AppRegistrationClientId: '$(AppRegistrationClientId)'
+      AppRegistrationTenantId: '$(AppRegistrationTenantId)'
+      ServiceEndpointUrl: '$(ServiceEndpointUrl)'
+      FolderPath: '$(Pipeline.Workspace)'
+      Pattern: '**/*osx*.pkg'
+      UseMinimatch: true
+      signConfigType: inlineSignParams
+      inlineOperation: |
         [
           {
-            "KeyCode": "$(KeyCode)",
+            "KeyCode": "CP-401337-Apple",
             "OperationCode": "MacAppDeveloperSign",
-            "ToolName": "sign",
-            "ToolVersion": "1.0",
             "Parameters": {
-              "Hardening": "Enable",
-              "OpusInfo": "http://microsoft.com"
-            }
+              "Hardening": "--options=runtime"
+            },
+            "ToolName": "sign",
+            "ToolVersion": "1.0"
           }
         ]
+    retryCountOnTaskFailure: 2
+    timeoutInMinutes: 15
+
+  - task: EsrpCodeSigning@5
+    displayName: 'Notarize macOS Installer Package'
+    inputs:
+      ConnectedServiceName: 'ESRPMacOSSigning'
+      AppRegistrationClientId: '$(AppRegistrationClientId)'
+      AppRegistrationTenantId: '$(AppRegistrationTenantId)'
+      ServiceEndpointUrl: '$(ServiceEndpointUrl)'
+      FolderPath: '$(Pipeline.Workspace)'
+      Pattern: '**/*osx*.pkg'
+      UseMinimatch: true
+      signConfigType: inlineSignParams
+      inlineOperation: |
+        [
+          {
+            "KeyCode": "CP-401337-Apple",
+            "OperationCode": "MacAppNotarize",
+            "Parameters": {
+              "BundleId": "$(BundleId)"
+            },
+            "ToolName": "sign",
+            "ToolVersion": "1.0"
+          }
+        ]
+    retryCountOnTaskFailure: 2
+    timeoutInMinutes: 90
 
   - pwsh: |
-      $signedPkg = Get-ChildItem -Path $(Pipeline.Workspace) -Filter "*osx*.zip" -File
+      $pkgFiles = Get-ChildItem -Path $(Pipeline.Workspace) -Filter "*.pkg" -Recurse -File
 
-      $signedPkg | ForEach-Object {
-        Write-Verbose -Verbose "Signed package zip: $_"
-
-        if (-not (Test-Path $_)) {
-          throw "Package not found: $_"
-        }
-
-        if (-not (Test-Path $(ob_outputDirectory))) {
-          $null = New-Item -Path $(ob_outputDirectory) -ItemType Directory
-        }
-
-        Expand-Archive -Path $_ -DestinationPath $(ob_outputDirectory) -Verbose
+      if ($pkgFiles.Count -eq 0) {
+        throw "No signed .pkg files found"
       }
 
-      Write-Verbose -Verbose "Expanded pkg file:"
+      if (-not (Test-Path $(ob_outputDirectory))) {
+        $null = New-Item -Path $(ob_outputDirectory) -ItemType Directory
+      }
+
+      foreach ($p in $pkgFiles) {
+        Write-Verbose -Verbose "Copying signed package: $($p.FullName)"
+        Copy-Item -Path $p.FullName -Destination $(ob_outputDirectory)
+      }
+
+      Write-Verbose -Verbose "Output directory contents:"
       Get-ChildItem -Path $(ob_outputDirectory) | Write-Verbose -Verbose
-    displayName: Expand signed file
+    displayName: Copy signed packages to output
